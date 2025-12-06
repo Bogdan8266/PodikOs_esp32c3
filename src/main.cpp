@@ -949,7 +949,7 @@ void startSettingsAnimation() {
     isAnimating = true;
     animStartTime = millis();
     animStartSettingsPos = animatedSettingsPosition;
-    animStartSettingsScroll = animatedSettingsScroll; // Запам'ятовуємо і початковий скрол
+    animStartSettingsScroll = animatedSettingsScroll; // Запам'ятовуємо початковий скрол
 }
 
 
@@ -959,7 +959,6 @@ void startSettingsAnimation() {
 
 // --- Централізовані функції керування затяжкою ---
 void startPuff() {
-    // Нова логіка: обробка заблокованого стану
     if (isFireLocked) {
         fireUnlockPresses++;
         Serial.printf("Fire locked. Press count: %d\n", fireUnlockPresses);
