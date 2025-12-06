@@ -929,7 +929,7 @@ void loop() {
     updateVaporAnimation(); // Це для загального прогресу анімації, що керує появою частинок
     updateLed();
     updateAndDraw();
-    ledcWrite(PWM_CHANNEL, 255);
+    
 }
 
 // --- Анімація та рендеринг ---
