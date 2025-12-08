@@ -37,7 +37,7 @@
 
 // --- Налаштування PWM ---
 #define PWM_CHANNEL 0
-#define PWM_FREQ 5000
+#define PWM_FREQ 20000
 #define PWM_RESOLUTION 8
 
 // --- Налаштування 2D GFX ---
@@ -279,22 +279,34 @@ void projectAndDraw(const Point3D* vertices, int numVertices, const Edge* edges,
 
 
 
-
-
 void endPuff() {
     if (!isPuffing) return; // Вже неактивна
+    
+    // --- ТИМЧАСОВИЙ ТЕСТ ---
+    ledcWrite(PWM_CHANNEL, 0); // Вимикаємо мосфет при відпусканні
+    // -------------------------
+
     isPuffing = false;
     pwmActive = false;
     
-    // Рахуємо затяжку, якщо вона була достатньо довгою
-    unsigned long currentPuffDuration = millis() - puffStartTime_ms;
-    if (currentPuffDuration >= 200) {
-      puffCount++;
-      // Тут можна додати збереження в Preferences
-    }
-    puffStartTime_ms = 0;
-    Serial.println("Puff Ended");
+// ...existing code...
 }
+
+
+// void endPuff() {
+//     if (!isPuffing) return; // Вже неактивна
+//     isPuffing = false;
+//     pwmActive = false;
+    
+//     // Рахуємо затяжку, якщо вона була достатньо довгою
+//     unsigned long currentPuffDuration = millis() - puffStartTime_ms;
+//     if (currentPuffDuration >= 200) {
+//       puffCount++;
+//       // Тут можна додати збереження в Preferences
+//     }
+//     puffStartTime_ms = 0;
+//     Serial.println("Puff Ended");
+// }
 
 void clearAllParticles() {
     for (int j = 0; j < MAX_PARTICLES; j++) vaporParticles[j].active = false;
@@ -567,6 +579,14 @@ void setup() {
     pinMode(PIN_BTN_B, INPUT_PULLUP);
     pinMode(PIN_BTN_R, INPUT_PULLUP);
     pinMode(PIN_BTN_L, INPUT_PULLUP);
+
+
+    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+
+    // Надійніше явно встановити пін як вихід і увімкнути внутрішній pull-down (якщо доступний)
+    // Якщо OUTPUT_PULLDOWN не підтримується у твоїй версії, використай gpio_pulldown_en() з driver/gpio.h
+    pinMode(PIN_MOSFET, OUTPUT);         // вивід
+    digitalWrite(PIN_MOSFET, LOW);    
 
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
         btnReading[i] = digitalRead(btnPins[i]);
@@ -954,49 +974,72 @@ void startSettingsAnimation() {
 
 
 
-
-
-
-// --- Централізовані функції керування затяжкою ---
 void startPuff() {
     if (isFireLocked) {
-        fireUnlockPresses++;
-        Serial.printf("Fire locked. Press count: %d\n", fireUnlockPresses);
-
-        // Показуємо повідомлення на екрані на 2 секунди
-        showLockedMessage = true;
-        lockedMessageEndTime = millis() + 2000;
-
-        if (fireUnlockPresses >= 5) {
-            isFireLocked = false;
-            fireUnlockPresses = 0;
-            showLockedMessage = false; // Одразу ховаємо повідомлення
-            Serial.println("Fire unlocked!");
-            // Тут можна буде додати коротке повідомлення "Unlocked"
-        }
+// ...existing code...
         return; // Не починаємо затяжку, бо ми в режимі розблокування
     }
 
     if (isPuffing) return; // Стара логіка: не починати, якщо вже активна
+    
+    // --- ТИМЧАСОВИЙ ТЕСТ ---
+    // Ігноруємо всі криві і одразу вмикаємо 100%
+    ledcWrite(PWM_CHANNEL, 255);
+    // -------------------------
 
+    // Логіка для LED залишається
     switch(currentLEDEffect) {
-        case FX_RANDOM_PUFF:
-            currentPuffColor = strip.ColorHSV(random(0, 65535));
-            break;
-        case FX_STATIC_RED:    currentPuffColor = strip.Color(255, 0, 0); break;
-        case FX_STATIC_GREEN:  currentPuffColor = strip.Color(0, 255, 0); break;
-        case FX_STATIC_BLUE:   currentPuffColor = strip.Color(0, 0, 255); break;
-        case FX_STATIC_PURPLE: currentPuffColor = strip.Color(128, 0, 255); break;
-        case FX_STATIC_YELLOW: currentPuffColor = strip.Color(255, 255, 0); break;
-        case FX_STATIC_WHITE:  currentPuffColor = strip.Color(255, 255, 255); break;
-        default: break; // Для Rainbow колір генерується динамічно
+// ...existing code...
     }
 
     isPuffing = true;
     pwmActive = true;
     puffStartTime_ms = millis();
-    Serial.println("Puff Started");
+    Serial.println("Puff Started at 100% DUTY");
 }
+
+
+
+// --- Централізовані функції керування затяжкою ---
+// void startPuff() {
+//     if (isFireLocked) {
+//         fireUnlockPresses++;
+//         Serial.printf("Fire locked. Press count: %d\n", fireUnlockPresses);
+
+//         // Показуємо повідомлення на екрані на 2 секунди
+//         showLockedMessage = true;
+//         lockedMessageEndTime = millis() + 2000;
+
+//         if (fireUnlockPresses >= 5) {
+//             isFireLocked = false;
+//             fireUnlockPresses = 0;
+//             showLockedMessage = false; // Одразу ховаємо повідомлення
+//             Serial.println("Fire unlocked!");
+//             // Тут можна буде додати коротке повідомлення "Unlocked"
+//         }
+//         return; // Не починаємо затяжку, бо ми в режимі розблокування
+//     }
+
+//     if (isPuffing) return; // Стара логіка: не починати, якщо вже активна
+
+//     switch(currentLEDEffect) {
+//         case FX_RANDOM_PUFF:
+//             currentPuffColor = strip.ColorHSV(random(0, 65535));
+//             break;
+//         case FX_STATIC_RED:    currentPuffColor = strip.Color(255, 0, 0); break;
+//         case FX_STATIC_GREEN:  currentPuffColor = strip.Color(0, 255, 0); break;
+//         case FX_STATIC_BLUE:   currentPuffColor = strip.Color(0, 0, 255); break;
+//         case FX_STATIC_PURPLE: currentPuffColor = strip.Color(128, 0, 255); break;
+//         case FX_STATIC_YELLOW: currentPuffColor = strip.Color(255, 255, 0); break;
+//         case FX_STATIC_WHITE:  currentPuffColor = strip.Color(255, 255, 255); break;
+//         default: break; // Для Rainbow колір генерується динамічно
+//     }
+
+//     isPuffing = true;
+//     pwmActive = true;
+//     puffStartTime_ms = millis();
+//     Serial.println("Puff Started");
+// }
 
 
 
