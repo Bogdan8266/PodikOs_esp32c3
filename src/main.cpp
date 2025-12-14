@@ -23,7 +23,7 @@
 #include "bitmaps.h"
 #include "Jersey10_Regular20pt7b.h"
 #include "Jersey10_Regular12pt7b.h"
-
+#include <INA226.h>
 // --- Налаштування пінів ---
 #define PIN_LED 6 // Вбудований LED
 #define PIN_BTN_M 7 // Center
@@ -53,10 +53,16 @@ int fireUnlockPresses = 0;
 bool showLockedMessage = false;
 unsigned long lockedMessageEndTime = 0;
 
-
+unsigned long MIN_PUFF_DURATION = 200; // Мінімум 200 мс для активної затяжки
 
 #define PIN_LED_WS2812B 21
 #define LED_COUNT 1
+// --- Змінні для INA226 ---
+float measuredVoltage = 0.0f;  // Напруга на навантаженні (V)
+float measuredCurrent = 0.0f;  // Струм (A)
+float measuredPower = 0.0f;    // Потужність (W)
+
+INA226 ina226(0x40, &Wire); 
 
 // Нові налаштування для LED ефектів
 enum LEDEffect {
@@ -112,7 +118,7 @@ const char* screenStateNames[] = {"MAIN", "MENU_VIEW", "SETTINGS", "POWER_CURVE"
 const int MAIN_MENU_COUNT = 4; // MAIN, SETTINGS, STATS, INFO
 
 // --- Змінні ---
-int wattage = 20;
+int wattage = 200;
 int puffCount = 9999;
 float voltage = 3.7;
 int batteryPercent = 75;
@@ -207,6 +213,13 @@ int currentSettingsItem = 0;
 int brightness = 100;
 bool pidEnabled = true;
 
+
+
+
+
+
+
+
 // --- Налаштування Power Curve ---
 struct Point {
     float x; // 0.0 to 1.0 (час)
@@ -262,6 +275,7 @@ void    updatePWM();
   void  updateLed();
   void drawVaporAnimation();
 void draw3DPreview();
+void updateINA226(); 
 
 
 struct Point3D { float x, y, z; };
@@ -279,34 +293,21 @@ void projectAndDraw(const Point3D* vertices, int numVertices, const Edge* edges,
 
 
 
+
 void endPuff() {
     if (!isPuffing) return; // Вже неактивна
-    
-    // --- ТИМЧАСОВИЙ ТЕСТ ---
-    ledcWrite(PWM_CHANNEL, 0); // Вимикаємо мосфет при відпусканні
-    // -------------------------
-
     isPuffing = false;
     pwmActive = false;
     
-// ...existing code...
+    // Рахуємо затяжку, якщо вона була достатньо довгою
+    unsigned long currentPuffDuration = millis() - puffStartTime_ms;
+    if (currentPuffDuration >= 200) {
+      puffCount++;
+      // Тут можна додати збереження в Preferences
+    }
+    puffStartTime_ms = 0;
+    Serial.println("Puff Ended");
 }
-
-
-// void endPuff() {
-//     if (!isPuffing) return; // Вже неактивна
-//     isPuffing = false;
-//     pwmActive = false;
-    
-//     // Рахуємо затяжку, якщо вона була достатньо довгою
-//     unsigned long currentPuffDuration = millis() - puffStartTime_ms;
-//     if (currentPuffDuration >= 200) {
-//       puffCount++;
-//       // Тут можна додати збереження в Preferences
-//     }
-//     puffStartTime_ms = 0;
-//     Serial.println("Puff Ended");
-// }
 
 void clearAllParticles() {
     for (int j = 0; j < MAX_PARTICLES; j++) vaporParticles[j].active = false;
@@ -464,7 +465,11 @@ const Edge sphereEdges[] = { // Icosahedron edges
 const int numSphereVertices = sizeof(sphereVertices) / sizeof(Point3D);
 const int numSphereEdges = sizeof(sphereEdges) / sizeof(Edge);
 
+
 void updatePWM() {
+    //Serial.printf("DEBUG: isPuffing=%d, pwmActive=%d, elapsed=%lu ms\n", 
+                  //isPuffing, pwmActive, millis() - puffStartTime_ms);
+    
     if (!isPuffing || !pwmActive) {
         ledcWrite(PWM_CHANNEL, 0);
         return;
@@ -472,24 +477,18 @@ void updatePWM() {
 
     unsigned long elapsed_ms = millis() - puffStartTime_ms;
 
-    // 1. Перевірка на тайм-аут затяжки
     if (elapsed_ms >= (puffTimeout_s * 1000)) {
         Serial.println("Puff Timeout Reached! Locking fire button.");
         endPuff();
-        isFireLocked = true; // Блокуємо до відпускання кнопки
-        // Можна додати візуальний фідбек, наприклад, блимання екраном або вібрацію
+        isFireLocked = true;
         return;
     }
 
-    // 2. Розрахунок прогресу по кривій
     float timeProgress = (float)elapsed_ms / (curveTotalTime * 1000.0f);
-    if (timeProgress > 1.0f) {
-        timeProgress = 1.0f; // Обмежуємо прогрес, щоб не вийти за межі кривої
-    }
+    if (timeProgress > 1.0f) timeProgress = 1.0f;
 
     float powerCurveMultiplier = 0.0f;
 
-    // 3. Інтерполяція потужності по сегментах кривої
     if (timeProgress <= powerCurvePoints[0].x) {
         powerCurveMultiplier = powerCurvePoints[0].y;
     } else {
@@ -503,15 +502,13 @@ void updatePWM() {
         }
     }
     
-    // 4. Розрахунок кінцевої потужності (поки що без INA226, просто % від максимуму)
-    // Максимальна потужність 200W (як вказано в UI)
-    float wattageMultiplier = (float)wattage / 200.0f;
-    
+    // ← ЗМІНЕНО: Тепер просто використовуємо криву потужності без множення на wattage
+    float wattageMultiplier = wattage / 200.0f; // Нормалізуємо потужність (максимум 200W)
     float finalPowerMultiplier = powerCurveMultiplier * wattageMultiplier;
     finalPowerMultiplier = constrain(finalPowerMultiplier, 0.0f, 1.0f); // Захист від перевищення
 
-    // 5. Перетворення потужності в значення ШІМ і відправка на MOSFET
     int finalPwmValue = (int)(finalPowerMultiplier * 255);
+    Serial.printf("PWM Value: %d, Curve: %.2f\n", finalPwmValue, powerCurveMultiplier);
     ledcWrite(PWM_CHANNEL, finalPwmValue);
 }
 
@@ -554,10 +551,34 @@ void draw3DPreview() {
     display.print(shapeNames[current3DShape]);
 }
 
+// ...existing code...
 void setup() {
+
+
+
+
     Serial.begin(115200);
     Serial.println("\n\n--- PodikOS Booting ---");
-    // ...existing code...
+
+
+
+    delay(2000);
+    Serial.println("\n--- I2C Scanning ---");
+    
+    Wire.begin(PIN_SDA, PIN_SCL);
+    
+    // Сканування I2C пристроїв
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("I2C device found at address 0x%02X\n", addr);
+        }
+    }
+    
+    Serial.println("--- I2C Scan Complete ---\n");
+    
+
+    
     // Ініціалізуємо всі частинки як неактивні
     for (int i = 0; i < MAX_PARTICLES; i++) {
         vaporParticles[i].active = false;
@@ -572,38 +593,42 @@ void setup() {
         bubbleParticles[i].active = false;
     }
 
-    // Ініціалізація точок кривої потужності (x, y)
-// ...existing code...
+    // Ініціалізація пінів кнопок
     pinMode(PIN_BTN_M, INPUT_PULLUP);
     pinMode(PIN_BTN_F, INPUT_PULLUP);
     pinMode(PIN_BTN_B, INPUT_PULLUP);
     pinMode(PIN_BTN_R, INPUT_PULLUP);
     pinMode(PIN_BTN_L, INPUT_PULLUP);
 
-
+    // --- ОДИН РАЗ ІНІЦІАЛІЗУЄМО ШІМ ТА ПІН ---
+    // Налаштовуємо LEDC-таймер
     ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    // Приєднуємо пін до LEDC-каналу
+    ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
+    // Встановлюємо ШІМ на 0 (MOSFET вимкнений)
+    ledcWrite(PWM_CHANNEL, 0);
+    // ----------------------------------------
 
-    // Надійніше явно встановити пін як вихід і увімкнути внутрішній pull-down (якщо доступний)
-    // Якщо OUTPUT_PULLDOWN не підтримується у твоїй версії, використай gpio_pulldown_en() з driver/gpio.h
-    pinMode(PIN_MOSFET, OUTPUT);         // вивід
-    digitalWrite(PIN_MOSFET, LOW);    
-
+    // Ініціалізація debounce для кнопок
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
         btnReading[i] = digitalRead(btnPins[i]);
         btnStable[i] = btnReading[i];
         btnLastChange[i] = millis();
     }
 
+    // Ініціалізація I2C (для дисплея, MPU, BMP)
     Wire.begin(PIN_SDA, PIN_SCL);
     
-
+    // Ініціалізація дисплея
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         Serial.println(F("SSD1306 allocation failed"));
-        for (;;);
+        for (;;); // Зависаємо, якщо дисплей не знайдено
     }
+    
+
+
     display.clearDisplay();
     display.display();
-    // Використовуємо глобальну змінну brightness для встановлення початкової яскравості
     display.ssd1306_command(SSD1306_SETCONTRAST);
     display.ssd1306_command(map(brightness, 0, 100, 0, 255));
 
@@ -617,33 +642,44 @@ void setup() {
         mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     }
 
-    // Ініціалізація ШІМ
-    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-    ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
-    ledcWrite(PWM_CHANNEL, 0);
+     // Ініціалізація INA226
+    if (!ina226.begin()) {
+        Serial.println("INA226 not found! Check I2C connection.");
+    } else {
+        Serial.println("INA226 initialized!");
+        
+        // ВАЖЛИВО: Налаштування для твого резистора R100 (0.1 Ом)
+        // Шунт: 0.1 Ом
+        // Максимальний струм: 20A (для вейпа це нормально)
+        int error = ina226.setMaxCurrentShunt(20.0, 0.1, true);
+        if (error != INA226_ERR_NONE) {
+            Serial.printf("INA226 calibration error: %d\n", error);
+        }
+        
+        // Встановлюємо режим постійних вимірювань
+        ina226.setMode(7);  // Mode 7 = continuous shunt + bus voltage
+        
+        Serial.println("INA226 calibrated for 20A max, 0.1Ω shunt");
+    }
 
-    // Ініціалізація датчика тиску
+    // Ініціалізація датчика тиску BMP180
     if (!bmp.begin()) {
         Serial.println("Could not find a valid BMP180 sensor, check wiring!");
     }
 
-    // Ініціалізація світлодіода
+    // Ініціалізація адресного світлодіода WS2812B
     strip.begin();
-    strip.show(); // Initialize all pixels to 'off'
-
-    // Ініціалізуємо всі частинки як неактивні
-    for (int i = 0; i < MAX_PARTICLES; i++) {
-        vaporParticles[i].active = false;
-    }
+    strip.show(); // Ініціалізуємо всі пікселі як вимкнені
 
     // Ініціалізація точок кривої потужності (x, y)
-    powerCurvePoints[0] = {0.0f, 0.2f};
-    powerCurvePoints[1] = {0.25f, 0.4f};
-    powerCurvePoints[2] = {0.6f, 0.8f};
-    powerCurvePoints[3] = {1.0f, 1.0f}; // Остання точка зафіксована по Y
+    powerCurvePoints[0] = {0.0f, 0.0f};    // Старт з 0
+    powerCurvePoints[1] = {0.25f, 0.7f};   // 25% часу = 70% потужності
+    powerCurvePoints[2] = {0.5f, 1.0f};    // 50% часу = 100% потужності
+    powerCurvePoints[3] = {1.0f, 1.0f};
 
     Serial.printf("Initial state: %s\n", screenStateNames[currentState]);
 }
+// ...existing code...
 
 // --- Нові функції для 2D GFX ---
 void spawnParticle(Particle &p) {
@@ -949,7 +985,7 @@ void loop() {
     updateVaporAnimation(); // Це для загального прогресу анімації, що керує появою частинок
     updateLed();
     updateAndDraw();
-    
+    updateINA226(); 
 }
 
 // --- Анімація та рендеринг ---
@@ -974,72 +1010,48 @@ void startSettingsAnimation() {
 
 
 
+
+
+//--- Централізовані функції керування затяжкою ---
 void startPuff() {
     if (isFireLocked) {
-// ...existing code...
+        fireUnlockPresses++;
+        Serial.printf("Fire locked. Press count: %d\n", fireUnlockPresses);
+
+        // Показуємо повідомлення на екрані на 2 секунди
+        showLockedMessage = true;
+        lockedMessageEndTime = millis() + 2000;
+
+        if (fireUnlockPresses >= 5) {
+            isFireLocked = false;
+            fireUnlockPresses = 0;
+            showLockedMessage = false; // Одразу ховаємо повідомлення
+            Serial.println("Fire unlocked!");
+            // Тут можна буде додати коротке повідомлення "Unlocked"
+        }
         return; // Не починаємо затяжку, бо ми в режимі розблокування
     }
 
     if (isPuffing) return; // Стара логіка: не починати, якщо вже активна
-    
-    // --- ТИМЧАСОВИЙ ТЕСТ ---
-    // Ігноруємо всі криві і одразу вмикаємо 100%
-    ledcWrite(PWM_CHANNEL, 255);
-    // -------------------------
 
-    // Логіка для LED залишається
     switch(currentLEDEffect) {
-// ...existing code...
+        case FX_RANDOM_PUFF:
+            currentPuffColor = strip.ColorHSV(random(0, 65535));
+            break;
+        case FX_STATIC_RED:    currentPuffColor = strip.Color(255, 0, 0); break;
+        case FX_STATIC_GREEN:  currentPuffColor = strip.Color(0, 255, 0); break;
+        case FX_STATIC_BLUE:   currentPuffColor = strip.Color(0, 0, 255); break;
+        case FX_STATIC_PURPLE: currentPuffColor = strip.Color(128, 0, 255); break;
+        case FX_STATIC_YELLOW: currentPuffColor = strip.Color(255, 255, 0); break;
+        case FX_STATIC_WHITE:  currentPuffColor = strip.Color(255, 255, 255); break;
+        default: break; // Для Rainbow колір генерується динамічно
     }
 
     isPuffing = true;
     pwmActive = true;
     puffStartTime_ms = millis();
-    Serial.println("Puff Started at 100% DUTY");
+    Serial.println("Puff Started");
 }
-
-
-
-// --- Централізовані функції керування затяжкою ---
-// void startPuff() {
-//     if (isFireLocked) {
-//         fireUnlockPresses++;
-//         Serial.printf("Fire locked. Press count: %d\n", fireUnlockPresses);
-
-//         // Показуємо повідомлення на екрані на 2 секунди
-//         showLockedMessage = true;
-//         lockedMessageEndTime = millis() + 2000;
-
-//         if (fireUnlockPresses >= 5) {
-//             isFireLocked = false;
-//             fireUnlockPresses = 0;
-//             showLockedMessage = false; // Одразу ховаємо повідомлення
-//             Serial.println("Fire unlocked!");
-//             // Тут можна буде додати коротке повідомлення "Unlocked"
-//         }
-//         return; // Не починаємо затяжку, бо ми в режимі розблокування
-//     }
-
-//     if (isPuffing) return; // Стара логіка: не починати, якщо вже активна
-
-//     switch(currentLEDEffect) {
-//         case FX_RANDOM_PUFF:
-//             currentPuffColor = strip.ColorHSV(random(0, 65535));
-//             break;
-//         case FX_STATIC_RED:    currentPuffColor = strip.Color(255, 0, 0); break;
-//         case FX_STATIC_GREEN:  currentPuffColor = strip.Color(0, 255, 0); break;
-//         case FX_STATIC_BLUE:   currentPuffColor = strip.Color(0, 0, 255); break;
-//         case FX_STATIC_PURPLE: currentPuffColor = strip.Color(128, 0, 255); break;
-//         case FX_STATIC_YELLOW: currentPuffColor = strip.Color(255, 255, 0); break;
-//         case FX_STATIC_WHITE:  currentPuffColor = strip.Color(255, 255, 255); break;
-//         default: break; // Для Rainbow колір генерується динамічно
-//     }
-
-//     isPuffing = true;
-//     pwmActive = true;
-//     puffStartTime_ms = millis();
-//     Serial.println("Puff Started");
-// }
 
 
 
@@ -1122,11 +1134,20 @@ void drawScreenByIndex(int index, int xOffset) {
 }
 
 void drawMainScreen(int xOffset) {
+    
     display.setTextColor(SSD1306_WHITE);
     int16_t x1, y1;
     uint16_t w, h;
     const int16_t top_margin = 2;
 
+    display.setFont(&Jersey10_Regular20pt7b);
+    char wattStr[8];
+
+    if (isPuffing && measuredPower > 0) {
+        sprintf(wattStr, "%.1fW", measuredPower);  // Реальна потужність від INA226
+    } else {
+        sprintf(wattStr, "%dW", wattage);  // Налаштована потужність
+    }
     display.setFont(&Jersey10_Regular12pt7b);
     char puffStr[12];
     sprintf(puffStr, "%d", puffCount);
@@ -1150,7 +1171,7 @@ void drawMainScreen(int xOffset) {
     display.drawBitmap(xOffset + display.width() - 18, 0, batteryIcon, 18, 9, SSD1306_WHITE);
 
     display.setFont(&Jersey10_Regular20pt7b);
-    char wattStr[8];
+    
     sprintf(wattStr, "%dW", wattage);
     display.getTextBounds(wattStr, 0, 0, &x1, &y1, &w, &h);
     int16_t x_center = (display.width() - w) / 2;
@@ -1341,13 +1362,16 @@ void drawSettingsScreen(float selectorY, float yScrollOffset) {
 }
 
 
-// --- Адаптовані та нові функції ---
+
 void readBMP180DataAndDetectPuff() {
+  
+  
   if (millis() - lastPressureReadTime < 100) return;
   lastPressureReadTime = millis();
   float currentPressure = bmp.readPressure();
   if (currentPressure == 0) return;
 
+  // Базовий розрахунок тиску для статистики (опціонально)
   if (!isPuffing) {
     pressureReadings[pressureReadingIndex] = currentPressure;
     pressureReadingIndex = (pressureReadingIndex + 1) % PRESSURE_READING_COUNT;
@@ -1370,7 +1394,10 @@ void readBMP180DataAndDetectPuff() {
       }
       break;
     case PUFF_ACTIVE:
-      if (currentPressure >= (baselinePressure_Pa - (puffPressureThreshold_Pa * 0.5))) {
+      // Чекаємо мінімум 200 мс перед тим, як дозволити закінчити затяжку
+      unsigned long puffDuration = millis() - puffStartTime_ms;
+      if (puffDuration >= MIN_PUFF_DURATION && 
+          currentPressure >= (baselinePressure_Pa - (puffPressureThreshold_Pa * 0.5))) {
         puffDetectorState = PUFF_IDLE;
         if (isPuffing) endPuff();
       }
@@ -1452,7 +1479,26 @@ void drawVaporAnimation() {
         display.fillRoundRect((display.width()/2) - vaporWidth, display.height() - vaporHeight -2, vaporWidth*2, vaporHeight, 4, SSD1306_INVERSE);
     }
 }// ...existing code...
-
+void updateINA226() {
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate < 100) return;  // Читаємо не частіше ніж раз на 100 мс
+    lastUpdate = millis();
+    
+    if (!ina226.isConnected()) {
+        Serial.println("INA226 disconnected!");
+        return;
+    }
+    
+    measuredVoltage = ina226.getBusVoltage();
+    measuredCurrent = ina226.getCurrent();
+    measuredPower = ina226.getPower();
+    
+    // Дебаг (закоментуй, якщо не треба)
+    if (isPuffing) {
+        Serial.printf("U: %.2fV, I: %.3fA, P: %.2fW\n", 
+                      measuredVoltage, measuredCurrent, measuredPower);
+    }
+}
 void handleButtons() {
     unsigned long now = millis();
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
@@ -1556,10 +1602,10 @@ void handleButtons() {
                 }
             }
             // --- Обробка відпускання кнопки ---
+                        // --- Обробка відпускання кнопки ---
             else if (wasPressed && btnStable[i] == HIGH) {
                 if (currentState == STATE_MAIN_SCREEN && i == 0) {
-                    endPuff();
-                    // Розблокування тепер відбувається в startPuff(), тому звідси його видалено.
+                    endPuff();  // ← ЗАТЯЖКА ЗАКІНЧУЄТЬСЯ ТІЛЬКИ ТЕПЕР
                 }
             }
         }
