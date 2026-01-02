@@ -24,6 +24,7 @@
 #include "Jersey10_Regular20pt7b.h"
 #include "Jersey10_Regular12pt7b.h"
 #include <INA226.h>
+#include <esp_sleep.h> 
 // --- Налаштування пінів ---
 #define PIN_LED 6 // Вбудований LED
 #define PIN_BTN_M 7 // Center
@@ -34,6 +35,14 @@
 #define PIN_MOSFET 20
 #define PIN_SDA 8
 #define PIN_SCL 9
+
+
+// --- Deep Sleep Variables ---
+RTC_DATA_ATTR int wakeUpPressCount = 0;
+RTC_DATA_ATTR unsigned long lastWakeUpButtonPressTime = 0;
+const unsigned long MULTI_PRESS_TIMEOUT_MS = 1500; // Час для серії натискань (1.5 секунди)
+const int REQUIRED_WAKE_PRESSES = 5; 
+
 
 // --- Налаштування PWM ---
 #define PWM_CHANNEL 0
@@ -122,6 +131,8 @@ int wattage = 200;
 int puffCount = 9999;
 float voltage = 3.7;
 int batteryPercent = 75;
+unsigned long lastInteractionTime = 0; // Час останньої взаємодії з пристроєм
+bool stateChanged = false; // Флаг для відстеження зміни стану
 
 // --- Структура для частинок ---
 struct Particle {
@@ -226,7 +237,7 @@ struct Point {
     float y; // 0.0 to 1.0 (потужність %)
 };
 Point powerCurvePoints[4];
-int selectedCurvePoint = 0; // 0-3 для точок, 4 для налаштування часу
+int selectedCurvePoint = 0; 
 float curveTotalTime = 1.0f;
 
 // --- Анімація ---
@@ -243,7 +254,7 @@ float animTargetMenuPos = 0.0f;
 float animatedSettingsPosition = 0.0f;
 float animStartSettingsPos = 0.0f;
 float animTargetSettingsPos = 0.0f;
-float animatedSettingsScroll = 0.0f; // Нова змінна для позиції скролу
+float animatedSettingsScroll = 0.0f; 
 float animStartSettingsScroll = 0.0f;
 float animTargetSettingsScroll = 0.0f;
 
@@ -260,7 +271,7 @@ const unsigned long DEBOUNCE_MS = 40;
 // --- Прототипи функцій ---
 void handleButtons();
 void updateAndDraw();
-void clearAllParticles(); // Новий прототип
+void clearAllParticles(); 
 void drawScreenByIndex(int index, int xOffset);
 void startMenuAnimation();
 void startSettingsAnimation();
@@ -276,6 +287,7 @@ void    updatePWM();
   void drawVaporAnimation();
 void draw3DPreview();
 void updateINA226(); 
+void enterDeepSleep();
 
 
 struct Point3D { float x, y, z; };
@@ -316,6 +328,44 @@ void clearAllParticles() {
     for (int j = 0; j < MAX_METABALLS; j++) metaballs[j].active = false;
 }
 
+void enterDeepSleep() {
+    Serial.println("Entering Deep Sleep...");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Going to sleep...");
+    display.display();
+    delay(500); // Give time for message to show
+
+    // Clear display and turn off NeoPixel before sleep
+    display.clearDisplay();
+    display.display();
+    strip.clear();
+    strip.show();
+
+    // Disable peripherals (optional but good practice)
+    // Закриття Wire (I2C)
+    Wire.end(); 
+    
+    // Переконайтеся, що інші енергоємні компоненти вимкнені, якщо це можливо.
+    // Наприклад, INA226 і BMP180 все ще будуть на I2C шині, але без активного Wire,
+    // вони будуть менш активні. Для повного вимкнення потрібне керування їх живленням.
+
+    // === ЗМІНА ТУТ: Налаштовуємо PIN_BTN_M як INPUT_PULLDOWN перед сном ===
+    pinMode(PIN_BTN_M, INPUT_PULLDOWN);
+
+    // Configure wake-up source: PIN_BTN_M (GPIO7) on HIGH level
+    // Використовуємо ext1 wakeup на ANY_HIGH, як ми обговорювали.
+    // Тепер кнопка буде тягнути пін HIGH при натисканні, якщо її "GND" підключений до 3.3V
+    {
+        uint64_t wakeMask = (1ULL << PIN_BTN_M);
+        esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+    }
+
+    // Enter deep sleep
+    esp_deep_sleep_start();
+}
 
 
 
@@ -551,86 +601,89 @@ void draw3DPreview() {
     display.print(shapeNames[current3DShape]);
 }
 
-// ...existing code...
 void setup() {
-
-
-
-
     Serial.begin(115200);
     Serial.println("\n\n--- PodikOS Booting ---");
 
+    // Check wake-up cause first
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    // === ЗМІНА ТУТ: Wake-up причина тепер ESP_SLEEP_WAKEUP_EXT1 ===
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+        Serial.printf("Woke up from external (GPIO) source! Current wakeUpPressCount: %d\n", wakeUpPressCount);
+        unsigned long currentTime = millis();
 
+        if (currentTime - lastWakeUpButtonPressTime < MULTI_PRESS_TIMEOUT_MS) {
+            wakeUpPressCount++;
+            Serial.printf("Multi-press detected. New count: %d\n", wakeUpPressCount);
+        } else {
+            // First press or timeout expired, reset count
+            wakeUpPressCount = 1;
+            Serial.println("First press after timeout. Count reset to 1.");
+        }
+        lastWakeUpButtonPressTime = currentTime;
+
+        if (wakeUpPressCount < REQUIRED_WAKE_PRESSES) {
+            Serial.printf("Not enough presses (%d/%d). Re-entering sleep to wait for more presses.\n", wakeUpPressCount, REQUIRED_WAKE_PRESSES);
+            
+            // Re-initialize display briefly to show message
+            // Wire.begin is needed for display.begin()
+            Wire.begin(PIN_SDA, PIN_SCL); 
+            if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+                Serial.println(F("SSD1306 allocation failed on short wake, continuing without display."));
+            } else {
+                display.clearDisplay();
+                display.setTextSize(1);
+                display.setTextColor(SSD1306_WHITE);
+                display.setCursor(0, 0);
+                display.printf("Press %d times\nto wake up!", REQUIRED_WAKE_PRESSES - wakeUpPressCount);
+                display.display();
+                delay(1000); // Show message for a bit
+            }
+            enterDeepSleep(); // Go back to sleep
+        } else {
+            Serial.println("Enough presses detected! Resuming normal operation.");
+            wakeUpPressCount = 0; // Reset for next time
+            lastWakeUpButtonPressTime = 0;
+            // Fall through to normal setup (full re-initialization)
+        }
+    } else {
+        Serial.printf("Woke up from: %s\n", (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) ? "Timer" : "Other/Reset");
+        wakeUpPressCount = 0; // Reset count on full reset or timer wake-up
+        lastWakeUpButtonPressTime = 0;
+        // Fall through to normal setup
+    }
+
+    // Initialize lastInteractionTime (will be updated by handleButtons during normal operation)
+    lastInteractionTime = millis();
 
     delay(2000);
     Serial.println("\n--- I2C Scanning ---");
     
-    Wire.begin(PIN_SDA, PIN_SCL);
+    // Wire.begin() might have already been called if waking up to show message,
+    // but calling it again is safe (Arduino Wire library handles multiple begin calls)
+    Wire.begin(PIN_SDA, PIN_SCL); 
     
-    // Сканування I2C пристроїв
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0) {
-            Serial.printf("I2C device found at address 0x%02X\n", addr);
-        }
-    }
-    
-    Serial.println("--- I2C Scan Complete ---\n");
-    
-
-    
-    // Ініціалізуємо всі частинки як неактивні
-    for (int i = 0; i < MAX_PARTICLES; i++) {
-        vaporParticles[i].active = false;
-    }
-    for (int i = 0; i < MAX_METABALLS; i++) {
-        metaballs[i].active = false;
-    }
-    for (int i = 0; i < MAX_POPCORN; i++) {
-        popcornParticles[i].active = false;
-    }
-    for (int i = 0; i < MAX_BUBBLES; i++) {
-        bubbleParticles[i].active = false;
-    }
-
-    // Ініціалізація пінів кнопок
-    pinMode(PIN_BTN_M, INPUT_PULLUP);
-    pinMode(PIN_BTN_F, INPUT_PULLUP);
-    pinMode(PIN_BTN_B, INPUT_PULLUP);
-    pinMode(PIN_BTN_R, INPUT_PULLUP);
-    pinMode(PIN_BTN_L, INPUT_PULLUP);
-
-    // --- ОДИН РАЗ ІНІЦІАЛІЗУЄМО ШІМ ТА ПІН ---
-    // Налаштовуємо LEDC-таймер
-    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-    // Приєднуємо пін до LEDC-каналу
-    ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
-    // Встановлюємо ШІМ на 0 (MOSFET вимкнений)
-    ledcWrite(PWM_CHANNEL, 0);
-    // ----------------------------------------
-
-    // Ініціалізація debounce для кнопок
+    // === ЗМІНА ТУТ: Ініціалізація пінів кнопок з PULLDOWN ===
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
+        pinMode(btnPins[i], INPUT_PULLDOWN); // ЗМІНИЛИ НА INPUT_PULLDOWN
         btnReading[i] = digitalRead(btnPins[i]);
         btnStable[i] = btnReading[i];
-        btnLastChange[i] = millis();
+        btnLastChange[i] = 0;
     }
-
-    // Ініціалізація I2C (для дисплея, MPU, BMP)
-    Wire.begin(PIN_SDA, PIN_SCL);
     
+    
+    // ...existing code...
     // Ініціалізація дисплея
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
         Serial.println(F("SSD1306 allocation failed"));
         for (;;); // Зависаємо, якщо дисплей не знайдено
     }
     
-
-
     display.clearDisplay();
     display.display();
     display.ssd1306_command(SSD1306_SETCONTRAST);
     display.ssd1306_command(map(brightness, 0, 100, 0, 255));
+
 
     // Ініціалізація гіроскопа MPU6050
     if (!mpu.begin()) {
@@ -986,6 +1039,10 @@ void loop() {
     updateLed();
     updateAndDraw();
     updateINA226(); 
+    if (currentState == STATE_MAIN_SCREEN && (millis() - lastInteractionTime > 60000)) { // 1 хвилина = 60000 мс
+        Serial.println("Inactivity timeout reached. Entering deep sleep.");
+        enterDeepSleep();
+    }
 }
 
 // --- Анімація та рендеринг ---
@@ -1501,17 +1558,21 @@ void updateINA226() {
 }
 void handleButtons() {
     unsigned long now = millis();
+    bool anyButtonPressed = false; // Flag to detect any button press
+
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
         bool r = digitalRead(btnPins[i]);
         if (r != btnReading[i]) {
             btnLastChange[i] = now;
             btnReading[i] = r;
         } else if ((now - btnLastChange[i]) > DEBOUNCE_MS && btnReading[i] != btnStable[i]) {
-            bool wasPressed = (btnStable[i] == LOW);
+            // === ЗМІНА ТУТ: wasPressed тепер перевіряє HIGH ===
+            bool wasPressed = (btnStable[i] == HIGH);
             btnStable[i] = btnReading[i];
 
-            if (!wasPressed && btnStable[i] == LOW) { // --- Обробка натискання ---
-                bool stateChanged = false;
+            // === ЗМІНА ТУТ: Виявлення натискання - тепер HIGH ===
+            if (!wasPressed && btnStable[i] == HIGH) { // --- Обробка натискання ---
+                anyButtonPressed = true; // Set flag when any button is pressed
                 
                 if (currentState == STATE_MAIN_SCREEN || currentState == STATE_MENU_VIEW) {
                     if (currentState == STATE_MAIN_SCREEN && i == 0) { // Center (M) on Main is Fire
@@ -1602,12 +1663,16 @@ void handleButtons() {
                 }
             }
             // --- Обробка відпускання кнопки ---
-                        // --- Обробка відпускання кнопки ---
-            else if (wasPressed && btnStable[i] == HIGH) {
+            // === ЗМІНА ТУТ: Виявлення відпускання - тепер LOW ===
+            else if (wasPressed && btnStable[i] == LOW) {
                 if (currentState == STATE_MAIN_SCREEN && i == 0) {
                     endPuff();  // ← ЗАТЯЖКА ЗАКІНЧУЄТЬСЯ ТІЛЬКИ ТЕПЕР
                 }
             }
         }
+    }
+    
+    if (anyButtonPressed) {
+        lastInteractionTime = now; // Update inactivity timer if any button was pressed
     }
 }
