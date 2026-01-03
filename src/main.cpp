@@ -12,6 +12,11 @@
    // Total vape time, Energy used(Joules &Watts last session), Cartridge lifespan tracker.Drop Counter : Використовувати акселерометр для детекції вільного падіння(Freefall detection) та удару.Інкрементувати лічильник "Drop Stats".Plug - in Counter : Лічильник підключень зарядного кабелю(детекція по різкому стрибку напруги на дільнику).Info Screen : OS Version, Device Owner, Serial Number, Uptime.Easter Egg : Міні - гра при багаторазовому натисканні на версію ПЗ.6. Settings Menu : Screen Brightness.Animation Speed.Sensor Raw Data(Gyro / Meteo view with smoothing option).LED Config.7. Data Management : Використовувати Preferences.h(NVS) для збереження всіх налаштувань, статистики та IR - кодів.Дані не повинні зникати при розряді АКБ.IMPLEMENTATION NOTES : Використовувати FreeRTOS для багатозадачності : Core 0(або окремий Task) : Рендеринг графіки та UI(низький пріоритет).Core 0(або окремий Task) : PID - регулятор потужності та зчитування сенсорів(високий пріоритет, критично для безпеки).Реалізувати Deep Sleep після таймауту неактивності.
 
 #include <Arduino.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -24,7 +29,7 @@
 #include "Jersey10_Regular20pt7b.h"
 #include "Jersey10_Regular12pt7b.h"
 #include <INA226.h>
-#include <esp_sleep.h> 
+
 // --- Налаштування пінів ---
 #define PIN_LED 6 // Вбудований LED
 #define PIN_BTN_M 7 // Center
@@ -32,7 +37,7 @@
 #define PIN_BTN_B 3 // DOWN
 #define PIN_BTN_R 2 // Right
 #define PIN_BTN_L 1 // Left
-#define PIN_MOSFET 20
+#define PIN_MOSFET 10
 #define PIN_SDA 8
 #define PIN_SCL 9
 
@@ -40,7 +45,7 @@
 // --- Deep Sleep Variables ---
 RTC_DATA_ATTR int wakeUpPressCount = 0;
 RTC_DATA_ATTR unsigned long lastWakeUpButtonPressTime = 0;
-const unsigned long MULTI_PRESS_TIMEOUT_MS = 1500; // Час для серії натискань (1.5 секунди)
+const unsigned long MULTI_PRESS_TIMEOUT_MS = 5000; // Час для серії натискань (1.5 секунди)
 const int REQUIRED_WAKE_PRESSES = 5; 
 
 
@@ -327,46 +332,74 @@ void clearAllParticles() {
     for (int j = 0; j < MAX_POPCORN; j++) popcornParticles[j].active = false;
     for (int j = 0; j < MAX_METABALLS; j++) metaballs[j].active = false;
 }
-
 void enterDeepSleep() {
-    Serial.println("Entering Deep Sleep...");
+    Serial.println("--- Entering Deep Sleep (Active LOW Diagnosis) ---");
+    
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.print("Going to sleep...");
+    display.print("Check Buttons...");
     display.display();
-    delay(500); // Give time for message to show
 
-    // Clear display and turn off NeoPixel before sleep
-    display.clearDisplay();
-    display.display();
-    strip.clear();
-    strip.show();
-
-    // Disable peripherals (optional but good practice)
-    // Закриття Wire (I2C)
-    Wire.end(); 
+    // Перевіряємо піни 1, 2, 3, 4
+    const int wakePins[] = {PIN_BTN_L, PIN_BTN_R, PIN_BTN_F, PIN_BTN_B};
+    const char* pinNames[] = {"LEFT (1)", "RIGHT (2)", "FRONT (4)", "BACK (3)"};
     
-    // Переконайтеся, що інші енергоємні компоненти вимкнені, якщо це можливо.
-    // Наприклад, INA226 і BMP180 все ще будуть на I2C шині, але без активного Wire,
-    // вони будуть менш активні. Для повного вимкнення потрібне керування їх живленням.
+    bool stuckButton = false;
 
-    // === ЗМІНА ТУТ: Налаштовуємо PIN_BTN_M як INPUT_PULLDOWN перед сном ===
-    pinMode(PIN_BTN_M, INPUT_PULLDOWN);
+    for(int i=0; i<4; i++) {
+        // Налаштовуємо як вхід з підтяжкою до 3.3V
+        gpio_reset_pin((gpio_num_t)wakePins[i]);
+        pinMode(wakePins[i], INPUT_PULLUP);
+        delay(10); // Даємо час сигналу стабілізуватись
 
-    // Configure wake-up source: PIN_BTN_M (GPIO7) on HIGH level
-    // Використовуємо ext1 wakeup на ANY_HIGH, як ми обговорювали.
-    // Тепер кнопка буде тягнути пін HIGH при натисканні, якщо її "GND" підключений до 3.3V
-    {
-        uint64_t wakeMask = (1ULL << PIN_BTN_M);
-        esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+        // Якщо читаємо LOW (0), значить кнопка натиснута (або коротить на землю)
+        if (digitalRead(wakePins[i]) == LOW) {
+            Serial.printf("ALARM: Pin %s is STUCK LOW!\n", pinNames[i]);
+            
+            display.clearDisplay();
+            display.setCursor(0, 0);
+            display.print("ERROR: STUCK PIN!");
+            display.setCursor(0, 15);
+            display.print(pinNames[i]);
+            display.display();
+            
+            stuckButton = true;
+        } else {
+             Serial.printf("Pin %s is OK (HIGH).\n", pinNames[i]);
+        }
     }
 
-    // Enter deep sleep
+    if (stuckButton) {
+        Serial.println("Aborting sleep. Fix the wiring!");
+        delay(5000); // Чекаємо 5 секунд, щоб ти побачив повідомлення
+        return; // Не йдемо спати, повертаємось в loop
+    }
+
+    // Якщо все чисто - спимо
+    display.clearDisplay();
+    display.setCursor(0,10);
+    display.print("Goodnight...");
+    display.display();
+    delay(500);
+
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    strip.clear();
+    strip.show();
+    Wire.end(); 
+    
+    uint64_t wakeup_mask = 0;
+    for(int i=0; i<4; i++) {
+        gpio_num_t pin = (gpio_num_t)wakePins[i];
+        wakeup_mask |= (1ULL << wakePins[i]);
+        gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY);
+        gpio_hold_en(pin); 
+    }
+
+    esp_deep_sleep_enable_gpio_wakeup(wakeup_mask, ESP_GPIO_WAKEUP_GPIO_LOW);
     esp_deep_sleep_start();
 }
-
 
 
 Point3D rotateX(Point3D p, float angle) {
@@ -602,14 +635,30 @@ void draw3DPreview() {
 }
 
 void setup() {
+    gpio_hold_dis((gpio_num_t)PIN_BTN_L);
+    gpio_hold_dis((gpio_num_t)PIN_BTN_R);
+    gpio_hold_dis((gpio_num_t)PIN_BTN_F);
+    gpio_hold_dis((gpio_num_t)PIN_BTN_B);
+    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    
+    // 2. Приєднуємо пін до каналу
+    ledcAttachPin(PIN_MOSFET, PWM_CHANNEL);
+    
+    // 3. Одразу вимикаємо (безпека)
+    ledcWrite(PWM_CHANNEL, 0);
     Serial.begin(115200);
     Serial.println("\n\n--- PodikOS Booting ---");
-
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+        Serial.println("Woke up from GPIO Button!");
+        // Тут можна пропустити анімацію завантаження, щоб включилось миттєво
+    } else {
+        Serial.println("Normal Boot");
+    }
     // Check wake-up cause first
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    // === ЗМІНА ТУТ: Wake-up причина тепер ESP_SLEEP_WAKEUP_EXT1 ===
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-        Serial.printf("Woke up from external (GPIO) source! Current wakeUpPressCount: %d\n", wakeUpPressCount);
+    // Перевіряємо на GPIO wakeup або EXT1 wakeup (від GPIO)
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_GPIO || wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
+        Serial.printf("Woke up from GPIO source! Current wakeUpPressCount: %d\n", wakeUpPressCount);
         unsigned long currentTime = millis();
 
         if (currentTime - lastWakeUpButtonPressTime < MULTI_PRESS_TIMEOUT_MS) {
@@ -656,7 +705,7 @@ void setup() {
     // Initialize lastInteractionTime (will be updated by handleButtons during normal operation)
     lastInteractionTime = millis();
 
-    delay(2000);
+    //delay(2000);
     Serial.println("\n--- I2C Scanning ---");
     
     // Wire.begin() might have already been called if waking up to show message,
@@ -665,11 +714,12 @@ void setup() {
     
     // === ЗМІНА ТУТ: Ініціалізація пінів кнопок з PULLDOWN ===
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
-        pinMode(btnPins[i], INPUT_PULLDOWN); // ЗМІНИЛИ НА INPUT_PULLDOWN
+        // Тепер використовуємо PULLUP (бо кнопки замикають на GND)
+        pinMode(btnPins[i], INPUT_PULLUP); 
         btnReading[i] = digitalRead(btnPins[i]);
         btnStable[i] = btnReading[i];
         btnLastChange[i] = 0;
-    }
+    }  
     
     
     // ...existing code...
@@ -1039,7 +1089,7 @@ void loop() {
     updateLed();
     updateAndDraw();
     updateINA226(); 
-    if (currentState == STATE_MAIN_SCREEN && (millis() - lastInteractionTime > 60000)) { // 1 хвилина = 60000 мс
+    if (currentState == STATE_MAIN_SCREEN && (millis() - lastInteractionTime > 120000)) { // 1 хвилина = 60000 мс
         Serial.println("Inactivity timeout reached. Entering deep sleep.");
         enterDeepSleep();
     }
@@ -1558,32 +1608,37 @@ void updateINA226() {
 }
 void handleButtons() {
     unsigned long now = millis();
-    bool anyButtonPressed = false; // Flag to detect any button press
+    bool anyButtonPressed = false; // Флаг активності
 
     for (uint8_t i = 0; i < BTN_COUNT; ++i) {
         bool r = digitalRead(btnPins[i]);
+        
+        // Дебаунс (антибрязкіт)
         if (r != btnReading[i]) {
             btnLastChange[i] = now;
             btnReading[i] = r;
-        } else if ((now - btnLastChange[i]) > DEBOUNCE_MS && btnReading[i] != btnStable[i]) {
-            // === ЗМІНА ТУТ: wasPressed тепер перевіряє HIGH ===
-            bool wasPressed = (btnStable[i] == HIGH);
-            btnStable[i] = btnReading[i];
+        } 
+        else if ((now - btnLastChange[i]) > DEBOUNCE_MS && btnReading[i] != btnStable[i]) {
+            // Стан кнопки змінився і стабілізувався
+            
+            bool wasPressed = (btnStable[i] == LOW); // Запам'ятовуємо, чи була вона натиснута раніше
+            btnStable[i] = btnReading[i];            // Оновлюємо стабільний стан
 
-            // === ЗМІНА ТУТ: Виявлення натискання - тепер HIGH ===
-            if (!wasPressed && btnStable[i] == HIGH) { // --- Обробка натискання ---
-                anyButtonPressed = true; // Set flag when any button is pressed
+            // === ОБРОБКА НАТИСКАННЯ (Active LOW) ===
+            // Якщо раніше була відпущена (HIGH), а стала натиснута (LOW)
+            if (!wasPressed && btnStable[i] == LOW) { 
+                anyButtonPressed = true; 
                 
                 if (currentState == STATE_MAIN_SCREEN || currentState == STATE_MENU_VIEW) {
-                    if (currentState == STATE_MAIN_SCREEN && i == 0) { // Center (M) on Main is Fire
+                    if (currentState == STATE_MAIN_SCREEN && i == 0) { // Center (M) -> FIRE
                         startPuff();
                     } else {
                         switch (i) {
-                            case 1: if (currentState == STATE_MAIN_SCREEN) wattage = min(200, wattage + 1); break;
-                            case 2: if (currentState == STATE_MAIN_SCREEN) wattage = max(5, wattage - 1); break;
-                            case 3: animTargetMenuPos++; startMenuAnimation(); break;
-                            case 4: animTargetMenuPos--; startMenuAnimation(); break;
-                            case 0:
+                            case 1: if (currentState == STATE_MAIN_SCREEN) wattage = min(200, wattage + 1); break; // UP
+                            case 2: if (currentState == STATE_MAIN_SCREEN) wattage = max(5, wattage - 1); break;   // DOWN
+                            case 3: animTargetMenuPos++; startMenuAnimation(); break; // Right
+                            case 4: animTargetMenuPos--; startMenuAnimation(); break; // Left
+                            case 0: // Center (Menu Enter)
                                 if (!isAnimating && ((int)round(animTargetMenuPos) % MAIN_MENU_COUNT + MAIN_MENU_COUNT) % MAIN_MENU_COUNT == 1) {
                                     currentState = STATE_SETTINGS_MENU; stateChanged = true;
                                     currentSettingsItem = 0; animTargetSettingsPos = 0; animatedSettingsPosition = 0;
@@ -1598,7 +1653,7 @@ void handleButtons() {
                     }
                 } else if (currentState == STATE_SETTINGS_MENU) {
                      switch (i) {
-                        case 0: // Center (M)
+                        case 0: // Center (M) - Select
                             if (!isAnimating) {
                                 if (currentSettingsItem == 2) { currentState = STATE_POWER_CURVE; selectedCurvePoint = 0; } 
                                 else if (currentSettingsItem == 5) { // 2D GFX
@@ -1613,19 +1668,19 @@ void handleButtons() {
                                 }
                             }
                             break;
-                        case 1: // UP
+                        case 1: // UP - Scroll Up
                             currentSettingsItem = (currentSettingsItem + SETTINGS_ITEM_COUNT - 1) % SETTINGS_ITEM_COUNT;
                             animTargetSettingsPos = currentSettingsItem;
                             animTargetSettingsScroll = max(0.0f, animTargetSettingsPos - 2.0f);
                             startSettingsAnimation();
                             break;
-                        case 2: // DOWN
+                        case 2: // DOWN - Scroll Down
                             currentSettingsItem = (currentSettingsItem + 1) % SETTINGS_ITEM_COUNT;
                             animTargetSettingsPos = currentSettingsItem;
                             animTargetSettingsScroll = max(0.0f, animTargetSettingsPos - 2.0f);
                             startSettingsAnimation();
                             break;
-                        case 3: // Right (R)
+                        case 3: // Right (R) - Increase/Next
                             if (currentSettingsItem == 0) { brightness = min(100, brightness + 10); display.ssd1306_command(SSD1306_SETCONTRAST); display.ssd1306_command(map(brightness, 0, 100, 0, 255)); } 
                             else if (currentSettingsItem == 1) { pidEnabled = !pidEnabled; } 
                             else if (currentSettingsItem == 3) { puffPressureThreshold_Pa = min(100.0f, puffPressureThreshold_Pa + 5.0f); } 
@@ -1633,9 +1688,8 @@ void handleButtons() {
                             else if (currentSettingsItem == 5) { currentGFXAnim = (GFXAnimation)((currentGFXAnim + 1) % GFX_ANIM_COUNT); clearAllParticles(); } 
                             else if (currentSettingsItem == 6) { current3DShape = (ShapeType)((current3DShape + 1) % SHAPE_COUNT); }
                             else if (currentSettingsItem == 7) { currentLEDEffect = (LEDEffect)((currentLEDEffect + 1) % LED_EFFECT_COUNT); }
-                            
                             break;
-                         case 4: // Left (L)
+                         case 4: // Left (L) - Decrease/Prev
                             if (currentSettingsItem == 0) { brightness = max(0, brightness - 10); display.ssd1306_command(SSD1306_SETCONTRAST); display.ssd1306_command(map(brightness, 0, 100, 0, 255)); } 
                             else if (currentSettingsItem == 1) { pidEnabled = !pidEnabled; } 
                             else if (currentSettingsItem == 3) { puffPressureThreshold_Pa = max(10.0f, puffPressureThreshold_Pa - 5.0f); } 
@@ -1643,11 +1697,10 @@ void handleButtons() {
                             else if (currentSettingsItem == 5) { currentGFXAnim = (GFXAnimation)((currentGFXAnim + GFX_ANIM_COUNT - 1) % GFX_ANIM_COUNT); clearAllParticles(); } 
                             else if (currentSettingsItem == 6) { current3DShape = (ShapeType)((current3DShape + SHAPE_COUNT - 1) % SHAPE_COUNT); }
                             else if (currentSettingsItem == 7) { currentLEDEffect = (LEDEffect)((currentLEDEffect + LED_EFFECT_COUNT - 1) % LED_EFFECT_COUNT); }
-                            
                             break;
                     }
                 } else if (currentState == STATE_POWER_CURVE) {
-                    // ... (логіка для редактора кривих без змін) ...
+                    // ... (логіка для редактора кривих без змін, якщо вона була) ...
                 } else if (currentState == STATE_GFX_PREVIEW) {
                     switch (i) {
                         case 3: currentGFXAnim = (GFXAnimation)((currentGFXAnim + 1) % GFX_ANIM_COUNT); clearAllParticles(); break;
@@ -1662,17 +1715,17 @@ void handleButtons() {
                     }
                 }
             }
-            // --- Обробка відпускання кнопки ---
-            // === ЗМІНА ТУТ: Виявлення відпускання - тепер LOW ===
-            else if (wasPressed && btnStable[i] == LOW) {
+            // === ОБРОБКА ВІДПУСКАННЯ (Active LOW) ===
+            // Якщо раніше була натиснута (LOW), а стала відпущена (HIGH)
+            else if (wasPressed && btnStable[i] == HIGH) {
                 if (currentState == STATE_MAIN_SCREEN && i == 0) {
-                    endPuff();  // ← ЗАТЯЖКА ЗАКІНЧУЄТЬСЯ ТІЛЬКИ ТЕПЕР
+                    endPuff();  // Затяжка закінчується, коли відпускаєш кнопку (HIGH)
                 }
             }
         }
     }
     
     if (anyButtonPressed) {
-        lastInteractionTime = now; // Update inactivity timer if any button was pressed
+        lastInteractionTime = now; 
     }
 }
